@@ -1,3 +1,7 @@
+# COROS接入更新
+
+当前COROS入口已迁移为MCP。连接方式、读取命令、数据范围及推送边界见[COROS MCP说明](api-tools/README_MCP.md)。下文涉及旧Token/邮箱/密码或Web API的内容是历史说明，不能作为当前COROS接入步骤。
+
 # Marathon Copilot — 你的 AI 马拉松教练
 
 > 从长期训练规划到比赛日配速，再到赛后深度复盘——覆盖全马备赛全周期的智能助手。

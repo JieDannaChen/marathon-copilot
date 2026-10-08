@@ -1,0 +1,4 @@
+{
+  "transport": "host",
+  "response_file": "reports/coros_mcp_response.json"
+}

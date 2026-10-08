@@ -82,3 +82,7 @@ Thumbs.db
 *~
 .vscode/
 .idea/
+
+# Private MCP transport configuration and responses
+api-tools/coros_mcp.local.json
+api-tools/coros_mcp_response*.json

@@ -1,36 +1,12 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "pyyaml"]
+# dependencies = ["mcp>=1.26,<2", "pyyaml"]
 # ///
-"""
-generate_next_week_plan.py — COROS → 算法引擎 → training-weekly 自动化桥梁
+"""Prepare weekly analysis and plan context using COROS MCP.
 
-端到端流程:
-  1. 从 COROS 拉取上周实际训练数据
-  2. 加载 runner_profile + training_cycle_config
-  3. 用 training_calculator 计算下周训练框架（配速/跑量/阶段）
-  4. 获取下周 7 天天气预报 + 适跑指数
-  5. 生成结构化上下文，供 training-weekly skill (LLM) 生成完整周计划
-
-Usage:
-  # 完整流程：拉数据 + 生成 prompt（默认）
-  python generate_next_week_plan.py --token <TOKEN>
-
-  # 指定配置文件
-  python generate_next_week_plan.py --token <TOKEN> \\
-      --runner runner_profile_xxx.yaml \\
-      --cycle training_cycle_config.yaml
-
-  # 仅生成上周报告（不含下周计划）
-  python generate_next_week_plan.py --token <TOKEN> --report-only
-
-  # 输出 JSON（给其他脚本消费）
-  python generate_next_week_plan.py --token <TOKEN> --json
-
-  # 使用 .env 中的 COROS 凭据（无需 --token）
-  python generate_next_week_plan.py
-"""
+Usage: python generate_next_week_plan.py --mcp-snapshot response.json --report-only
+See README_MCP.md for host execution and standalone transports."""
 
 from __future__ import annotations
 
@@ -45,6 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from coros_client import CorosClient, format_pace, format_duration, get_sport_name
+from coros_mcp import add_mcp_arguments
 from coros_weekly_report import (
     analyze_weekly_data,
     format_markdown_report,
@@ -82,17 +59,6 @@ except ImportError:
 
 # ── Config Loaders ─────────────────────────────────────────────────
 
-def load_env():
-    """Load .env file if exists."""
-    env_path = SCRIPT_DIR / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
-
-
 def find_yaml_config(pattern: str) -> Path | None:
     """Find a YAML config file matching pattern in api-tools dir."""
     for p in SCRIPT_DIR.glob(pattern):
@@ -128,26 +94,6 @@ def load_cycle_config(path: str | None = None) -> dict | None:
     if p and p.exists():
         with open(p, encoding="utf-8") as f:
             return yaml.safe_load(f)
-    return None
-
-
-# ── Resolve COROS Token ────────────────────────────────────────────
-
-def resolve_token(args) -> str | None:
-    """Resolve COROS token from args, env, or token manager."""
-    if args.token:
-        return args.token
-    # Try .env
-    load_env()
-    token = os.environ.get("COROS_TOKEN")
-    if token:
-        return token
-    # Try token manager cache
-    try:
-        from coros_token_manager import get_valid_token
-        return get_valid_token()
-    except (ImportError, Exception):
-        pass
     return None
 
 
@@ -384,7 +330,19 @@ def generate_skill_prompt(
     lines.append("## 5. 恢复状态评估（COROS 多维数据）")
     lines.append("")
 
-    if health_data:
+    if health_data and health_data.get("source") == "COROS MCP":
+        lines.append("### MCP设备快照（整体指标，不是局部伤病恢复许可）")
+        for name, value in health_data.get("mcp_raw", {}).items():
+            lines.append(f"#### {name}")
+            lines.append(str(value))
+        load_raw = health_data.get("training_load", {}).get("mcp_raw")
+        if load_raw is not None:
+            lines.append("#### training load")
+            lines.append(str(load_raw))
+        lines.append("HRV、睡眠、安静心率未取得时保持缺失；短长期负荷不替代ATI/CTI。")
+        lines.append("疼痛、无力、麻木或跑姿改变需单独评估，设备Recovery不能覆盖。")
+        lines.append("")
+    elif health_data:
         # 5a. HRV Assessment
         hrv = health_data.get("sleep_hrv", {})
         if hrv.get("baseline"):
@@ -535,7 +493,9 @@ def generate_skill_prompt(
         # Fallback: old simple assessment when health data unavailable
         actual = coros_analysis.get("actual", {})
         training_load = actual.get("training_load", 0)
-        if training_load > 500:
+        if training_load is None:
+            lines.append("- 训练负荷未取得，不据此建议增量")
+        elif training_load > 500:
             lines.append("- 训练负荷: 偏高 (>500)，建议本周适当降量")
         elif training_load > 350:
             lines.append(f"- 训练负荷: 中等 ({training_load})，可正常推进")
@@ -647,12 +607,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    auth = parser.add_argument_group("COROS 认证")
-    auth.add_argument("--token", help="COROS accessToken")
-    auth.add_argument("--email", help="COROS 账号")
-    auth.add_argument("--password", help="COROS 密码")
-
-    parser.add_argument("--region", choices=["cn", "intl"], default="cn")
+    add_mcp_arguments(parser)
     parser.add_argument("--runner", help="跑者档案 YAML 路径")
     parser.add_argument("--cycle", help="训练周期配置 YAML 路径")
     parser.add_argument("--city", default="Shanghai", help="天气查询城市 (默认: Shanghai)")
@@ -674,19 +629,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # ── Resolve token ──
-    token = resolve_token(args)
-    if not token:
-        if args.email and args.password:
-            client = CorosClient(region=args.region)
-            client.login(args.email, args.password)
-        else:
-            print("错误: 需要 --token 或 --email + --password，"
-                  "或在 .env 中设置 COROS_TOKEN", file=sys.stderr)
-            sys.exit(1)
-    else:
-        client = CorosClient(region=args.region)
-        client.set_token(token)
+    client = CorosClient.from_args(args)
 
     # ── Load configs ──
     runner_profile = load_runner_profile(args.runner)
@@ -697,7 +640,7 @@ def main():
     summary = client.generate_weekly_summary(weeks_ago=args.weeks_ago)
 
     if summary["total_activities"] == 0:
-        print("该周无训练记录。", file=sys.stderr)
+        print("查询范围内无跑步记录。", file=sys.stderr)
         sys.exit(0)
 
     print(f"  获取到 {summary['total_activities']} 条活动, "
@@ -716,7 +659,7 @@ def main():
         hrv_daily = health_summary.get("sleep_hrv", {}).get("daily", [])
         rec_pct = health_summary.get("recovery", {}).get("recovery_pct", "?")
         print(f"  HRV 数据: {len(hrv_daily)} 天, 恢复度: {rec_pct}%, "
-              f"安静心率: {health_summary.get('resting_hr', '?')} bpm",
+              f"安静心率: {health_summary.get('resting_hr') or '未取得'}",
               file=sys.stderr)
     except Exception as e:
         print(f"  Warning: 健康数据获取失败 ({e})，使用简化模型", file=sys.stderr)
@@ -731,7 +674,7 @@ def main():
     analysis = analyze_weekly_data(summary, plan_data)
 
     # ── Compute week info ──
-    today = datetime.now()
+    today = datetime.combine(client.today, datetime.min.time())
     last_monday = today - timedelta(days=today.weekday() + 7 * args.weeks_ago)
     week_info = {}
     if cycle_config:
@@ -751,11 +694,11 @@ def main():
         print(f"  周报已保存: {report_path}", file=sys.stderr)
 
     if args.report_only:
-        # Just output the analysis
-        if args.json:
-            print(json.dumps(analysis, ensure_ascii=False, indent=2))
+        output = json.dumps(analysis, ensure_ascii=False, indent=2) if args.json else format_markdown_report(analysis)
+        if args.output:
+            Path(args.output).write_text(output, encoding="utf-8")
         else:
-            print(format_markdown_report(analysis))
+            print(output)
         return
 
     # ── Weather forecast ──

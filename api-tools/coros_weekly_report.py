@@ -1,31 +1,12 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "pyyaml"]
+# dependencies = ["mcp>=1.26,<2", "pyyaml"]
 # ///
-"""
-COROS Weekly Training Analyzer.
+"""Generate weekly training reports using COROS MCP.
 
-Bridges COROS watch data with Marathon Copilot's training plan,
-producing a structured "actual vs plan" weekly report for LLM-based
-training adjustments.
-
-Usage:
-  # Generate weekly report (last week) using token
-  python coros_weekly_report.py --token <TOKEN>
-
-  # Generate report for current week
-  python coros_weekly_report.py --token <TOKEN> --weeks-ago 0
-
-  # Generate report with training plan comparison
-  python coros_weekly_report.py --token <TOKEN> --plan training_cycle_config.yaml
-
-  # Output as JSON for downstream LLM processing
-  python coros_weekly_report.py --token <TOKEN> --json
-
-  # Output as markdown for human reading
-  python coros_weekly_report.py --token <TOKEN> --markdown
-"""
+Usage: python coros_weekly_report.py --mcp-snapshot response.json --weeks-ago 0
+See README_MCP.md for connection configuration."""
 
 from __future__ import annotations
 
@@ -38,6 +19,7 @@ from datetime import datetime, timedelta
 # Import sibling module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from coros_client import CorosClient, format_pace, format_duration, get_sport_name
+from coros_mcp import add_mcp_arguments
 
 try:
     import yaml
@@ -188,6 +170,10 @@ def analyze_weekly_data(summary: dict, plan: dict | None = None) -> dict:
         Structured analysis dict for LLM consumption.
     """
     analysis = {
+        "source": summary.get("source"),
+        "scope": summary.get("scope"),
+        "complete": summary.get("complete"),
+        "queried_through": summary.get("queried_through"),
         "period": {
             "start": summary["week_start"],
             "end": summary["week_end"],
@@ -210,7 +196,7 @@ def analyze_weekly_data(summary: dict, plan: dict | None = None) -> dict:
         },
         "hr_summary": {
             "avg_hr_range": "--",
-            "max_hr_peak": 0,
+            "max_hr_peak": None,
         },
         "activities_detail": [],
     }
@@ -223,6 +209,8 @@ def analyze_weekly_data(summary: dict, plan: dict | None = None) -> dict:
         run_type = classify_run(act) if "跑步" in sport_type or "室内跑" in sport_type else "other"
 
         detail = {
+            "label_id": act.get("label_id"),
+            "sport_type": act.get("sport_type"),
             "date": act["date"],
             "type": sport_type,
             "run_category": run_type,
@@ -243,7 +231,7 @@ def analyze_weekly_data(summary: dict, plan: dict | None = None) -> dict:
 
         if act["avg_hr"] and act["avg_hr"] > 0:
             hr_values.append(act["avg_hr"])
-        if act["max_hr"] and act["max_hr"] > analysis["hr_summary"]["max_hr_peak"]:
+        if act["max_hr"] and act["max_hr"] > (analysis["hr_summary"]["max_hr_peak"] or 0):
             analysis["hr_summary"]["max_hr_peak"] = act["max_hr"]
 
     # Round breakdown values
@@ -304,6 +292,9 @@ def format_markdown_report(analysis: dict) -> str:
     lines.append(f"# 周训练报告 {period['start']} ~ {period['end']}")
     lines.append("")
 
+    lines.append(f'数据源：{analysis.get("source", "未标记")}；范围：跑步；查询至{analysis.get("queried_through")}；整周完整：{analysis.get("complete")}')
+    lines.append("")
+
     # Plan context
     plan = analysis.get("plan")
     if plan:
@@ -318,7 +309,7 @@ def format_markdown_report(analysis: dict) -> str:
     lines.append("| 指标 | 数值 |")
     lines.append("|------|------|")
     lines.append(f"| 总活动数 | {actual['total_activities']} 次 |")
-    lines.append(f"| 跑步次数 | {actual['run_count']} 次 |")
+    lines.append(f"| 跑步记录数 | {actual['run_count']} 次 |")
     lines.append(f"| 跑步距离 | {actual['run_km']} km |")
     lines.append(f"| 跑步时长 | {actual['run_duration']} |")
     lines.append(f"| 训练负荷 | {actual['training_load']} |")
@@ -443,14 +434,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    auth = parser.add_argument_group("认证")
-    auth.add_argument("--user", "-u",
-                      help="用户标识 (如 runner_a, runner_b)，用于多用户 token 管理")
-    auth.add_argument("--token", help="COROS accessToken (覆盖 --user)")
-    auth.add_argument("--email", help="COROS 账号")
-    auth.add_argument("--password", help="COROS 密码")
-
-    parser.add_argument("--region", choices=["cn", "intl"], default="cn")
+    add_mcp_arguments(parser)
     parser.add_argument("--weeks-ago", type=int, default=1,
                         help="查询几周前的数据 (0=本周, 1=上周, 默认: 1)")
     parser.add_argument("--plan", help="训练计划配置文件路径 (YAML)")
@@ -464,22 +448,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Build client
-    client = CorosClient(region=args.region)
-    if args.token:
-        client.set_token(args.token)
-    elif args.email and args.password:
-        client.login(args.email, args.password)
-    else:
-        # Try multi-user token manager
-        try:
-            from coros_token_manager import get_valid_token
-            token = get_valid_token(region=args.region, user=args.user)
-            client.set_token(token)
-        except Exception as e:
-            print(f"错误: 需要 --token、--email + --password 或 --user\n{e}",
-                  file=sys.stderr)
-            sys.exit(1)
+    client = CorosClient.from_args(args)
 
     # Fetch data
     print(f"正在获取{'本' if args.weeks_ago == 0 else '上'}周训练数据...",
@@ -487,7 +456,7 @@ def main():
     summary = client.generate_weekly_summary(weeks_ago=args.weeks_ago)
 
     if summary["total_activities"] == 0:
-        print("该周无训练记录。", file=sys.stderr)
+        print("查询范围内无跑步记录。", file=sys.stderr)
         sys.exit(0)
 
     # Load plan if provided
